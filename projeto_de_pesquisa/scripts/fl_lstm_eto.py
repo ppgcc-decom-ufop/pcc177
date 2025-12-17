@@ -1,17 +1,15 @@
 """
-fl_tcn_eto.py
+fl_lstm_eto.py
 
 Simulação de Aprendizado Federado para previsão multivariada de ETo.
 - Cada cliente carrega seu CSV local (um CSV por cliente).
-- Modelo local: TCN (implementação simples).
+- Modelo local: LSTM (implementação simples).
 - Agregador: FedAvg ponderado por número de exemplos.
 - Simulação local (sem rede). 
 
 Uso:
-python fl_tcn_eto.py --clients_csvs path\lat-2.15_lon-59.85_am.csv path\lat-4.35_lon-40.05_ce.csv path\lat-8.75_lon-35.65_pe.csv path\lat-15.35_lon-55.45_mt.csv path\lat-19.75_lon-44.45_mg.csv path\lat-30.75_lon-55.45_rs.csv --target ETo --seq-len 4
+python fl_lstm_eto.py --clients_csvs path\lat-2.15_lon-59.85_am.csv path\lat-4.35_lon-40.05_ce.csv path\lat-8.75_lon-35.65_pe.csv path\lat-15.35_lon-55.45_mt.csv path\lat-19.75_lon-44.45_mg.csv path\lat-30.75_lon-55.45_rs.csv --target ETo --seq-len 4
 """
-
-
 import argparse
 import os
 import math
@@ -56,48 +54,29 @@ def make_windows_from_df(df: pd.DataFrame, feature_cols: List[str], target_col: 
         return None, None, scaler
     return np.stack(X_windows), np.array(y_windows), scaler
 
-# Definição do modelo TCN para regressão
-class Chomp1d(nn.Module):
-    def __init__(self, chomp):
-        super().__init__(); self.chomp = chomp
-    def forward(self, x): return x[:, :, :-self.chomp].contiguous()
 
-class TemporalBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel, dilation, padding, dropout=0.2):
+# Definição do modelo LSTM para regressão
+class LSTMRegressor(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2, bidirectional=False):
         super().__init__()
-        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel, padding=padding, dilation=dilation)
-        self.chomp1 = Chomp1d(padding)
-        self.relu1 = nn.ReLU(); self.dropout1 = nn.Dropout(dropout)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel, padding=padding, dilation=dilation)
-        self.chomp2 = Chomp1d(padding)
-        self.relu2 = nn.ReLU(); self.dropout2 = nn.Dropout(dropout)
-        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1, self.conv2, self.chomp2, self.relu2, self.dropout2)
-        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-        self.relu = nn.ReLU()
-    def forward(self, x):
-        out = self.net(x)
-        res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
+        self.lstm = nn.LSTM(input_size=input_size,
+                            hidden_size=hidden_size,
+                            num_layers=num_layers,
+                            batch_first=True,
+                            dropout=dropout if num_layers>1 else 0.0,
+                            bidirectional=bidirectional)
+        self.num_directions = 2 if bidirectional else 1
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * self.num_directions, hidden_size//2),
+            nn.ReLU(),
+            nn.Linear(hidden_size//2, 1)
+        )
 
-class TCN(nn.Module):
-    def __init__(self, input_size, channels=(32,32), kernel=2, dropout=0.1):
-        super().__init__()
-        layers = []
-        num_levels = len(channels)
-        for i in range(num_levels):
-            in_ch = input_size if i==0 else channels[i-1]
-            out_ch = channels[i]
-            dilation = 2**i
-            padding = (kernel-1)*dilation
-            layers.append(TemporalBlock(in_ch, out_ch, kernel=kernel, dilation=dilation, padding=padding, dropout=dropout))
-        self.network = nn.Sequential(*layers)
-        self.fc = nn.Sequential(nn.Linear(channels[-1], 32), nn.ReLU(), nn.Linear(32,1))
     def forward(self, x):
-        x = x.transpose(1,2)
-        y = self.network(x)
-        last = y[:, :, -1]
+        out, (hn, cn) = self.lstm(x)
+        last = out[:, -1, :]
         return self.fc(last).squeeze(1)
-
+                
 
 # Definição do Cliente no framework de Aprendizado Federado
 class FLClient:
@@ -112,7 +91,7 @@ class FLClient:
         self.batch_size = batch_size
         self.local_epochs = local_epochs
         self.lr = lr
-
+       
         n = len(self.df)
         cutoff = int(n*0.8) if n>10 else int(n*0.7)
         self.df_train = self.df.iloc[:cutoff].reset_index(drop=True)
@@ -124,12 +103,12 @@ class FLClient:
         self.train_loader = DataLoader(WindowDataset(X_tr, y_tr), batch_size=self.batch_size, shuffle=True)
         self.test_loader = DataLoader(WindowDataset(X_te, y_te), batch_size=self.batch_size, shuffle=False) if X_te is not None else None
         self.n_samples = len(y_tr)
-
-        self.model = TCN(input_size=len(self.feature_cols)).to(self.device)
+        
+        self.model = LSTMRegressor(input_size=len(self.feature_cols), hidden_size=64, num_layers=2, dropout=0.2, bidirectional=False).to(self.device)
         self.criterion = nn.MSELoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
-    def get_weights(self):
+    def get_weights(self):       
         return {k: v.cpu().clone() for k,v in self.model.state_dict().items()}
 
     def set_weights(self, state_dict):
@@ -166,7 +145,7 @@ class FLServer:
         self.clients = clients
         self.device = device
         if global_model is None:
-            self.global_model = TCN(input_size=len(clients[0].feature_cols)).to(self.device)
+            self.global_model = LSTMRegressor(input_size=len(clients[0].feature_cols), hidden_size=64, num_layers=2, dropout=0.2, bidirectional=False).to(self.device)
         else:
             self.global_model = global_model.to(self.device)
 
@@ -176,6 +155,7 @@ class FLServer:
         avg_state = {}
         total_weight = sum(weights)
         for k in state_dicts[0].keys():
+            
             avg = None
             for sd, w in zip(state_dicts, weights):
                 tensor = sd[k].float() * (w / total_weight)
@@ -205,9 +185,11 @@ class FLServer:
 def simulate_federated_learning(client_csvs: List[str], target_col: str='ETo', seq_len:int=4,
                                 rounds:int=10, clients_per_round:int=None, local_epochs:int=1,
                                 batch_size:int=32, lr:float=1e-3, device='cpu'):
+
     clients = []
     for csv_path in client_csvs:
         df = pd.read_csv(csv_path, sep=';')
+
         cols = [c for c in df.columns if c != target_col and c.lower()!='datetime']
         client_id = os.path.splitext(os.path.basename(csv_path))[0]
         print(f"Loading client {client_id} with {len(df)} rows and features {cols}")
@@ -217,16 +199,17 @@ def simulate_federated_learning(client_csvs: List[str], target_col: str='ETo', s
 
     server = FLServer(clients, device=device)
 
-    clients_per_round = clients_per_round or len(clients)  # default: all clients each round
+    clients_per_round = clients_per_round or len(clients)
 
     history = {'round': [], 'global_eval': []}
 
     for r in range(1, rounds+1):
         print(f"\n=== Round {r}/{rounds} ===")
+
         selected = random.sample(clients, min(clients_per_round, len(clients)))
         client_states = []
         client_samples = []
-        
+
         global_weights = server.distribute_weights()
         for c in selected:
             c.set_weights(global_weights)
